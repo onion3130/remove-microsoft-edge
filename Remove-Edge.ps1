@@ -21,7 +21,15 @@
 
     WebView2 Runtime is deliberately left installed and untouched. Many
     applications (and parts of Windows itself) render their UI with it, so
-    removing it breaks software. Only the Edge browser is removed.
+    removing it breaks software. Only the Edge browser is removed. If WebView2
+    was present before the run and is gone afterwards, that is reported as an
+    error instead of a successful removal.
+
+    Safety model: every deletion target is constrained to an exact Edge-specific
+    path and re-checked immediately before use. Process environment variables are
+    never trusted to decide where anything is deleted, because they are inherited
+    across the UAC elevation boundary. Validation that cannot be completed fails
+    closed.
 
 .PARAMETER VerifyOnly
     Change nothing. Report whether Edge is installed and whether the reinstall
@@ -38,10 +46,25 @@
 
 .PARAMETER CreateRestorePoint
     Try to create a System Restore point first. Requires System Protection to
-    be enabled; a failure here does not stop the script.
+    be enabled; a failure here is reported prominently but does not stop the
+    script. A restore point is not a backup and does not guarantee recovery.
 
 .PARAMETER DryRun
     Print what would be done and change nothing.
+
+.PARAMETER NoElevate
+    Do not ask Windows for administrator rights. Use this in unattended or
+    scheduled runs, where a UAC prompt would just hang.
+
+.PARAMETER AllowNoOtherBrowser
+    Explicitly bypass the alternative-browser check, for example when using
+    a portable browser that this tool cannot detect.
+
+.PARAMETER ExpectedPayloadSha256
+    Internal. The SHA-256 that an elevated relaunch of this exact file must
+    match, in the same LF-normalized form the loader uses. When supplied, the
+    script refuses to do anything at all unless its own bytes match, so an
+    elevated run can only ever execute the file that was verified.
 
 .EXAMPLE
     .\Remove-Edge.ps1
@@ -55,23 +78,15 @@
     .\Remove-Edge.ps1 -RemoveProfileData -CreateRestorePoint
     Creates a restore point, removes Edge, and removes the leftover profile.
 
-.PARAMETER NoElevate
-    Do not ask Windows for administrator rights. Use this in unattended or
-    scheduled runs, where a UAC prompt would just hang.
-
-.PARAMETER AllowNoOtherBrowser
-    Explicitly bypass the alternative-browser check, for example when using
-    a portable browser that this tool cannot detect.
-
 .EXAMPLE
     # no file needed - review the repo first, then accept the UAC prompt
-    irm https://raw.githubusercontent.com/onion3130/remove-microsoft-edge/v1.0.0/get.ps1 | iex
+    irm https://raw.githubusercontent.com/onion3130/remove-microsoft-edge/v1.0.1/get.ps1 | iex
 
 .NOTES
     The script asks for administrator rights itself, unless -NoElevate is used.
     Exit codes: 0 = Edge is not installed / was removed successfully
                 1 = Edge is still present after the attempt
-                2 = not elevated, or prerequisites missing
+                2 = not elevated, prerequisites missing, or environment refused
                 3 = operation or verification error
                 4 = re-launched itself elevated; the work continues in the new
                     window, which stays open with the report
@@ -84,7 +99,8 @@ param(
     [switch]$CreateRestorePoint,
     [switch]$DryRun,
     [switch]$NoElevate,
-    [switch]$AllowNoOtherBrowser
+    [switch]$AllowNoOtherBrowser,
+    [string]$ExpectedPayloadSha256 = ''
 )
 
 # Save script-level parameters before entering functions (which have their own
@@ -99,12 +115,20 @@ $ScriptPath = $PSCommandPath
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 
 # Microsoft Edge (stable) as Edge Update knows it.
 # Product names verified against EdgeUpdate\Clients on the test machine.
 # WebView2 has a separate product ID and is not a removal target.
 $EdgeProductGuid = '{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062}'
 $WebView2ProductGuid = '{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+$EdgeAppxName = 'Microsoft.MicrosoftEdge.Stable'
+
+# The only remote location this payload will accept a self-relaunch from. It is
+# pinned to a numeric tag of this repository on GitHub's raw host, so a
+# rewritten branch, a mirror, or plain HTTP cannot be substituted for it.
+$AllowedPayloadHost = 'raw.githubusercontent.com'
+$AllowedPayloadPathPattern = '^/onion3130/remove-microsoft-edge/v[0-9][^/]*/Remove-Edge\.ps1$'
 
 # When the script is piped straight into PowerShell (`irm <url> | iex`) it never
 # touches disk, so it needs to know its own URL to be able to re-launch itself
@@ -153,6 +177,65 @@ function Test-Elevated {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# --------------------------------------------------- environment integrity ---
+
+<#
+    Process environment variables can be rewritten by any user before this
+    script starts, and they are inherited by the elevated relaunch. A variable
+    such as LOCALAPPDATA or ProgramFiles therefore decides where an elevated
+    script deletes things. Every root that influences a deletion is compared
+    here against the value Windows reports from the registry, and a mismatch
+    refuses the destructive run.
+#>
+function Get-EnvironmentProblems {
+    $problems = @()
+    $pairs = @(
+        @{ Name = 'ProgramFiles';      Value = $env:ProgramFiles;        Expected = [Environment]::GetFolderPath('ProgramFiles') },
+        @{ Name = 'ProgramFiles(x86)'; Value = ${env:ProgramFiles(x86)}; Expected = [Environment]::GetFolderPath('ProgramFilesX86') },
+        @{ Name = 'LOCALAPPDATA';      Value = $env:LOCALAPPDATA;        Expected = [Environment]::GetFolderPath('LocalApplicationData') },
+        @{ Name = 'APPDATA';           Value = $env:APPDATA;             Expected = [Environment]::GetFolderPath('ApplicationData') },
+        @{ Name = 'ProgramData';       Value = $env:ProgramData;         Expected = [Environment]::GetFolderPath('CommonApplicationData') }
+    )
+    foreach ($pair in $pairs) {
+        if (-not $pair.Value) { continue }
+        if ($pair.Value.TrimEnd('\') -ne $pair.Expected.TrimEnd('\')) {
+            $problems += ('{0} is "{1}" but Windows reports "{2}"' -f $pair.Name, $pair.Value, $pair.Expected)
+        }
+    }
+
+    if ($env:ProgramW6432 -and
+        $env:ProgramW6432.TrimEnd('\') -ne [Environment]::GetFolderPath('ProgramFiles').TrimEnd('\')) {
+        $problems += ('ProgramW6432 is "{0}" but Windows reports "{1}"' -f
+            $env:ProgramW6432, [Environment]::GetFolderPath('ProgramFiles'))
+    }
+    if ("$env:SystemDrive" -notmatch '^[A-Za-z]:$') {
+        $problems += ('SystemDrive is "{0}", which is not a drive root' -f $env:SystemDrive)
+    }
+    if (-not $env:SystemRoot -or $env:SystemRoot -notmatch '^[A-Za-z]:\\Windows$' -or
+        -not (Test-Path -LiteralPath $env:SystemRoot -PathType Container)) {
+        $problems += ('SystemRoot is "{0}", which is not a Windows directory' -f $env:SystemRoot)
+    }
+    return @($problems)
+}
+
+# Derived from the registry-reported location, never from $env:PUBLIC, which a
+# caller can repoint at any folder they like.
+function Get-TrustedPublicRoot {
+    if ("$env:SystemDrive" -notmatch '^[A-Za-z]:$') { return '' }
+    return ($env:SystemDrive + '\Users\Public')
+}
+
+# Never $env:TEMP: the elevated relaunch writes the verified payload to a
+# temporary directory, so a caller-controlled TEMP would be a place to stage
+# code for an administrator run.
+function Get-TrustedTempRoot {
+    $local = [Environment]::GetFolderPath('LocalApplicationData')
+    $candidate = Join-Path $local 'Temp'
+    if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Container)) { return $candidate }
+    if ([Environment]::GetFolderPath('Windows')) { return (Join-Path ([Environment]::GetFolderPath('Windows')) 'Temp') }
+    return ''
+}
+
 function Get-ProgramFilesRoots {
     return @(@($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramW6432) |
         Where-Object { $_ } | Sort-Object -Unique)
@@ -198,13 +281,23 @@ function Assert-NoReparsePoints {
     if ($links.Count -gt 0) { throw "Refusing a tree containing reparse points: $Path" }
 }
 
+# Refuse any path that is not the shared EdgeCore / EdgeWebView payload, which
+# Windows and many applications still depend on.
+function Test-SharedEdgeComponentPath {
+    param([string]$Path)
+    return ($Path -match '(?i)\\Microsoft\\(EdgeCore|EdgeWebView)(\\|$)')
+}
+
 function Remove-EdgeApplicationDirectory {
     param([string]$Path)
     if (-not (Test-SafeEdgeApplicationDir $Path)) { throw "Unsafe removal path: $Path" }
+    if (Test-SharedEdgeComponentPath $Path) { throw "Refusing shared Edge component: $Path" }
     if (Test-Path -LiteralPath $Path) {
         Assert-NoReparsePoints $Path
         Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
     }
+    # The deletion must actually have happened; anything else is not success.
+    if (Test-Path -LiteralPath $Path) { throw "Removal did not clear $Path" }
     $root = Split-Path -Parent $Path
     if ((Test-Path -LiteralPath $root) -and
         @(Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop).Count -eq 0) {
@@ -221,13 +314,60 @@ function Get-EdgeRegistryPaths {
     }
 }
 
+<#
+    A second, literal allowlist applied at the moment of deletion. It exists so
+    that any future edit to Get-EdgeRegistryPaths still cannot aim Remove-Item
+    at a key that is not one of these four Edge-only registrations, and it can
+    never match the WebView2 product GUID.
+#>
+function Test-EdgeRegistryPathAllowed {
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    if ($Path -match [regex]::Escape($WebView2ProductGuid)) { return $false }
+    if ($Path -match '(?i)EdgeWebView|EdgeCore|DevTools') { return $false }
+    $normalized = $Path -replace '/', '\'
+    $patterns = @(
+        '^HKLM:\\SOFTWARE\\(WOW6432Node\\)?Microsoft\\EdgeUpdate\\Clients\\\{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062\}$',
+        '^HKLM:\\SOFTWARE\\(WOW6432Node\\)?Microsoft\\Windows\\CurrentVersion\\Uninstall\\Microsoft Edge$',
+        '^HKLM:\\SOFTWARE\\(WOW6432Node\\)?Clients\\StartMenuInternet\\Microsoft Edge$',
+        '^HKLM:\\SOFTWARE\\(WOW6432Node\\)?Microsoft\\Windows\\CurrentVersion\\App Paths\\msedge\.exe$'
+    )
+    foreach ($pattern in $patterns) {
+        if ($normalized -match $pattern) { return $true }
+    }
+    return $false
+}
+
+# A registry key can itself be a symbolic link to another location, in which
+# case Remove-Item -Recurse would follow it out of the intended scope.
+function Test-RegistryKeyNotLinked {
+    param([string]$Path)
+    try {
+        $key = Get-Item -LiteralPath $Path -ErrorAction Stop
+        return ($null -eq $key.GetValue('SymbolicLinkValue', $null))
+    }
+    catch { return $true }
+}
+
 function Get-EdgeShortcutPaths {
-    @(
-        (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Microsoft Edge.lnk'),
-        (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Microsoft Edge.lnk'),
-        (Join-Path $env:PUBLIC 'Desktop\Microsoft Edge.lnk'),
-        (Join-Path ([Environment]::GetFolderPath('Desktop')) 'Microsoft Edge.lnk')
-    ) | Sort-Object -Unique
+    $paths = @(
+        (Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'Microsoft\Windows\Start Menu\Programs\Microsoft Edge.lnk'),
+        (Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'Microsoft\Windows\Start Menu\Programs\Microsoft Edge.lnk')
+    )
+    $desktop = [Environment]::GetFolderPath('DesktopDirectory')
+    if ($desktop) { $paths += (Join-Path $desktop 'Microsoft Edge.lnk') }
+    $public = Get-TrustedPublicRoot
+    if ($public) { $paths += (Join-Path $public 'Desktop\Microsoft Edge.lnk') }
+    @($paths | Where-Object { $_ } | Sort-Object -Unique)
+}
+
+function Test-EdgeShortcutPathAllowed {
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    foreach ($candidate in Get-EdgeShortcutPaths) {
+        if ($candidate -eq $Path) { return $true }
+    }
+    return $false
 }
 
 function Test-EdgePresent {
@@ -236,6 +376,19 @@ function Test-EdgePresent {
         $State.AppDirs.Count -gt 0 -or $State.ClientKey -or $State.ArpEntry -or
         $State.Appx -or $State.ProvisionedAppx -or $State.Shortcuts -or
         $State.BrowserClient -or $State.AppPaths)
+}
+
+<#
+    The single place that decides whether a run succeeded, so that a run can
+    never be reported as a successful removal while a check failed or anything
+    is still present.
+#>
+function Get-RemovalOutcome {
+    param($State, [bool]$HadOperationError)
+    if ($State.AppxQueryFailed) { return $ExitError }
+    if ($HadOperationError) { return $ExitError }
+    if (Test-EdgePresent $State) { return $ExitStillPresent }
+    return $ExitOk
 }
 
 function Get-ExistingEdgeInstall {
@@ -290,6 +443,82 @@ function Test-EdgeExePresent {
     return @($found | Sort-Object -Unique)
 }
 
+<#
+    Identity check before any package is removed. Get-AppxPackage -Name takes a
+    wildcard pattern, so the returned objects are matched again here against the
+    exact stable Edge identity; WebView2, DevTools and any neighbouring package
+    can never pass this test.
+#>
+function Test-EdgeAppxIdentity {
+    param($Package)
+    if ($null -eq $Package) { return $false }
+    $name = [string]$Package.Name
+    if ($name -ne $EdgeAppxName) { return $false }
+    if ($name -match '(?i)WebView|DevTools') { return $false }
+    foreach ($property in @('PackageFamilyName', 'PackageFullName')) {
+        # Read the property reflectively: under Set-StrictMode a missing
+        # property raises an error instead of returning $null.
+        $info = $Package.PSObject.Properties[$property]
+        if ($null -eq $info) { continue }
+        $value = [string]$info.Value
+        if ($value -and -not $value.StartsWith('Microsoft.MicrosoftEdge.Stable_', [StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+<#
+    Maps an Authenticode status to a decision. Split out from the cmdlet call
+    so every status can be tested.
+
+      Valid      - signed by a publisher this machine trusts.
+      Untrusted  - anything else. Refuse to run it as administrator.
+      Unknown    - the signature is present and matches the file, but the
+                   certificate could not be validated (typically an offline
+                   machine). Reported, then allowed, because the hash still
+                   proves the bytes were not altered.
+
+    Note that a mismatched signature is reported as HashMismatch rather than
+    NotTrusted, so allowing NotTrusted does not allow a modified file.
+#>
+function Get-SignatureStatusVerdict {
+    param([string]$Status)
+    switch -Regex ([string]$Status) {
+        '^Valid$' { return 'Valid' }
+        '^NotTrusted$' { return 'Unknown' }
+        default { return 'Untrusted' }
+    }
+}
+
+<#
+    Authenticode verdict for the bundled uninstaller, which is about to run
+    with administrator rights.
+#>
+function Get-SignatureVerdict {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return [pscustomobject]@{ Verdict = 'Untrusted'; Detail = 'the file does not exist' }
+    }
+    try {
+        $signature = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
+    }
+    catch {
+        return [pscustomobject]@{ Verdict = 'Untrusted'; Detail = $_.Exception.Message }
+    }
+    $status = [string]$signature.Status
+    $verdict = Get-SignatureStatusVerdict $status
+    if ($verdict -eq 'Valid') {
+        $subject = 'unknown publisher'
+        if ($signature.SignerCertificate) { $subject = [string]$signature.SignerCertificate.Subject }
+        return [pscustomobject]@{ Verdict = $verdict; Detail = $subject }
+    }
+    if ($verdict -eq 'Unknown') {
+        return [pscustomobject]@{ Verdict = $verdict; Detail = ('certificate could not be validated ({0})' -f $status) }
+    }
+    return [pscustomobject]@{ Verdict = $verdict; Detail = ('signature status {0}' -f $status) }
+}
+
 function Get-EdgeState {
     $matchesAny = {
         param($Paths)
@@ -304,12 +533,12 @@ function Get-EdgeState {
     $appxQueryFailed = $false
     try {
         if ($allUsers) {
-            $appx = @(Get-AppxPackage -Name 'Microsoft.MicrosoftEdge.Stable' -AllUsers -ErrorAction Stop)
+            $appx = @(Get-AppxPackage -Name $EdgeAppxName -AllUsers -ErrorAction Stop)
             $provisioned = @(Get-AppxProvisionedPackage -Online -ErrorAction Stop |
-                Where-Object { $_.DisplayName -eq 'Microsoft.MicrosoftEdge.Stable' })
+                Where-Object { $_.DisplayName -eq $EdgeAppxName })
         }
         else {
-            $appx = @(Get-AppxPackage -Name 'Microsoft.MicrosoftEdge.Stable' -ErrorAction Stop)
+            $appx = @(Get-AppxPackage -Name $EdgeAppxName -ErrorAction Stop)
         }
     }
     catch {
@@ -349,7 +578,7 @@ function Get-EdgeState {
     return [pscustomobject]@{
         AppDirs          = @(Get-EdgeApplicationDirs)
         EdgeExe          = @(Test-EdgeExePresent)
-        UserEdgeExe      = [bool](Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'Microsoft\Edge\Application\msedge.exe'))
+        UserEdgeExe      = [bool](Test-Path -LiteralPath (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Microsoft\Edge\Application\msedge.exe'))
         ClientKey        = [bool](& $matchesAny @(
             "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\$EdgeProductGuid",
             "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\$EdgeProductGuid"))
@@ -370,24 +599,32 @@ function Get-EdgeState {
         ReinstallBlocked = $reinstallBlocked
         WebView2         = $webView2Installed
         HttpProgId       = $httpProgId
-        ProfilePath      = (Join-Path $env:LOCALAPPDATA 'Microsoft\Edge')
+        ProfilePath      = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Microsoft\Edge')
     }
 }
 
 function Show-EdgeState {
     param($State)
 
+    # "absent" and "could not be checked" must never read the same way.
+    $scope = $(if ($State.AllUsersChecked) { 'all users' } else { 'this user only' })
+    $presence = {
+        param($Value, [string]$Label)
+        if ($Value) { return $Label }
+        return ('absent ({0} checked)' -f $scope)
+    }
+
     Write-Step 'Current state'
     $rows = @(
-        @{ Label = 'Edge program files'; Value = $(if ($State.EdgeExe.Count -eq 0) { 'absent' } else { 'PRESENT (' + $State.EdgeExe.Count + ' exe)' }) },
-        @{ Label = 'Edge Update registration'; Value = $(if ($State.ClientKey) { 'PRESENT' } else { 'absent' }) },
-        @{ Label = 'Add/Remove Programs entry'; Value = $(if ($State.ArpEntry) { 'PRESENT' } else { 'absent' }) },
-        @{ Label = 'Edge appx package'; Value = $(if ($State.Appx) { 'PRESENT' } else { 'absent' }) },
-        @{ Label = 'Shortcuts'; Value = $(if ($State.Shortcuts) { 'PRESENT' } else { 'absent' }) },
-        @{ Label = 'Registered browser client'; Value = $(if ($State.BrowserClient) { 'PRESENT' } else { 'absent' }) },
-        @{ Label = 'App Paths registration'; Value = $(if ($State.AppPaths) { 'PRESENT' } else { 'absent' }) },
-        @{ Label = 'Provisioned stable appx'; Value = $(if ($State.ProvisionedAppx) { 'PRESENT' } else { 'absent / not queried' }) },
-        @{ Label = 'Current-user Edge install'; Value = $(if ($State.UserEdgeExe) { 'PRESENT (unsupported)' } else { 'absent' }) },
+        @{ Label = 'Edge program files'; Value = $(if ($State.EdgeExe.Count -eq 0) { & $presence $false 'PRESENT' } else { 'PRESENT (' + $State.EdgeExe.Count + ' exe)' }) },
+        @{ Label = 'Edge Update registration'; Value = (& $presence $State.ClientKey 'PRESENT') },
+        @{ Label = 'Add/Remove Programs entry'; Value = (& $presence $State.ArpEntry 'PRESENT') },
+        @{ Label = 'Edge appx package'; Value = (& $presence $State.Appx 'PRESENT') },
+        @{ Label = 'Shortcuts'; Value = (& $presence $State.Shortcuts 'PRESENT') },
+        @{ Label = 'Registered browser client'; Value = (& $presence $State.BrowserClient 'PRESENT') },
+        @{ Label = 'App Paths registration'; Value = (& $presence $State.AppPaths 'PRESENT') },
+        @{ Label = 'Provisioned stable appx'; Value = $(if ($State.ProvisionedAppx) { 'PRESENT' } elseif ($State.AllUsersChecked) { 'absent (all users checked)' } else { 'could not verify (needs administrator)' }) },
+        @{ Label = 'Current-user Edge install'; Value = (& $presence $State.UserEdgeExe 'PRESENT (unsupported)') },
         @{ Label = 'Reinstall policy set'; Value = $(if ($State.ReinstallBlocked) { 'yes (not guaranteed)' } else { 'no' }) },
         @{ Label = 'WebView2 Runtime (kept)'; Value = $(if ($State.WebView2) { 'installed' } else { 'not installed' }) }
     )
@@ -395,7 +632,8 @@ function Show-EdgeState {
         Write-Host ('   {0,-28} {1}' -f ($row.Label + ':'), $row.Value)
     }
     if (-not $State.AllUsersChecked) {
-        Write-Warn 'Non-admin report: Appx covers only this user; provisioned packages are not queried.'
+        Write-Warn ('Non-admin report: Appx covers {0}; provisioned packages and other' -f $scope)
+        Write-Warn "users' packages were not checked, so absence here is not proof."
     }
 }
 
@@ -412,10 +650,84 @@ function Get-InstalledBrowsers {
     $installed = @()
     foreach ($name in $candidates.Keys) {
         foreach ($path in $candidates[$name]) {
-            if (Test-Path -LiteralPath $path) { $installed += $name; break }
+            # An unset variable would otherwise produce a drive-rooted path that
+            # could match an unrelated file.
+            if (-not $path -or $path.StartsWith('\')) { continue }
+            if (Test-Path -LiteralPath $path -PathType Leaf) { $installed += $name; break }
         }
     }
     return $installed
+}
+
+# ------------------------------------------------------------- integrity ---
+
+function Get-TextSha256 {
+    param([string]$Text)
+    $normalized = $Text.Replace("`r`n", "`n")
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($normalized))).Replace('-', '')
+    }
+    finally { $sha.Dispose() }
+}
+
+function Get-SelfSha256 {
+    if (-not ($ScriptPath -and (Test-Path -LiteralPath $ScriptPath -PathType Leaf))) { return '' }
+    try { return Get-TextSha256 ([IO.File]::ReadAllText($ScriptPath)) }
+    catch { return '' }
+}
+
+<#
+    A relaunch runs this same file again with administrator rights, so before any
+    work happens the file must still be the file that was verified. A
+    writable script folder is otherwise a route to arbitrary elevated code.
+#>
+function Assert-SelfIntegrity {
+    param([string]$ExpectedSha256)
+    if (-not $ExpectedSha256) { return }
+    if ($ExpectedSha256 -notmatch '^[0-9a-fA-F]{64}$') {
+        throw 'The expected payload checksum is malformed.'
+    }
+    if (-not ($ScriptPath -and (Test-Path -LiteralPath $ScriptPath -PathType Leaf))) {
+        throw 'Cannot verify this script file, so it will not run.'
+    }
+    $actual = Get-SelfSha256
+    if (-not $actual) { throw 'Could not read this script file to verify it.' }
+    if ($actual -ne $ExpectedSha256.ToUpperInvariant()) {
+        throw 'This script file no longer matches the checksum it was verified with.'
+    }
+}
+
+<#
+    The self-relaunch source arrives from the caller's scope, so it is only
+    honoured when it is the pinned GitHub raw URL for a numeric tag and carries
+    a well-formed SHA-256. Without both, no relaunch is offered at all rather
+    than downloading something unverified.
+#>
+function Test-PinnedPayloadSource {
+    param([string]$Url, [string]$Sha256)
+    if (-not $Url -or -not $Sha256) { return $false }
+    if ($Sha256 -notmatch '^[0-9a-fA-F]{64}$') { return $false }
+    $uri = $null
+    if (-not [Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri)) { return $false }
+    if ($uri.Scheme -ne 'https') { return $false }
+    if ($uri.Host -ne $AllowedPayloadHost) { return $false }
+    if ($uri.AbsolutePath -notmatch $AllowedPayloadPathPattern) { return $false }
+    return $true
+}
+
+<#
+    The elevated relaunch must start the PowerShell that is already running this
+    script, by absolute path. Falling back to a bare "powershell.exe" would let
+    anything earlier on PATH be elevated instead, so an unresolvable host
+    returns nothing and no relaunch is offered.
+#>
+function Get-PowerShellHostPath {
+    foreach ($name in @('powershell.exe', 'pwsh.exe')) {
+        $candidate = Join-Path $PSHOME $name
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    }
+    return ''
 }
 
 function Get-ForwardedArguments {
@@ -429,35 +741,64 @@ function Get-SelfRelaunch {
     $kind = ''
     $inner = ''
     if ($ScriptPath -and (Test-Path -LiteralPath $ScriptPath -PathType Leaf)) {
+        # Pin this exact file: the elevated child re-checks its own bytes against
+        # the checksum computed here, so a replaced script cannot be elevated.
+        $selfHash = Get-SelfSha256
+        if (-not $selfHash) { return $null }
         $path = $ScriptPath.Replace("'", "''")
-        $inner = "& '$path' $switches"
+        $hash = $selfHash
+        $inner = "& '$path' $switches -ExpectedPayloadSha256 '$hash'"
         $kind = 'file'
     }
-    elseif ($RemoveEdgeUrl) {
+    elseif (Test-PinnedPayloadSource -Url $RemoveEdgeUrl -Sha256 $RemoveEdgeSha256) {
         $url = $RemoveEdgeUrl.Replace("'", "''")
-        $hash = $RemoveEdgeSha256.Replace("'", "''")
+        $hash = $RemoveEdgeSha256.ToUpperInvariant()
         $inner = @"
 `$ErrorActionPreference = 'Stop'
 `$ProgressPreference = 'SilentlyContinue'
 `$RemoveEdgeUrl = '$url'
 `$RemoveEdgeSha256 = '$hash'
 try {
-    `$source = ([string](Invoke-RestMethod -Uri `$RemoveEdgeUrl -UseBasicParsing -ErrorAction Stop)).Replace([string]([char]13) + [char]10, [string][char]10)
-    if (`$RemoveEdgeSha256) {
-        `$sha = [Security.Cryptography.SHA256]::Create()
-        try {
-            `$actual = [BitConverter]::ToString(`$sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(`$source))).Replace('-', '')
-        } finally { `$sha.Dispose() }
-        if (`$actual -ne `$RemoveEdgeSha256) { throw 'Downloaded script hash mismatch. Nothing was executed.' }
-    }
+    `$response = Invoke-WebRequest -Uri `$RemoveEdgeUrl -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+    if (`$response.BaseResponse.ResponseUri.Host -ne '$AllowedPayloadHost') { throw 'Unexpected download host.' }
+    `$source = [string]`$response.Content
+    `$source = `$source.Replace([string]([char]13) + [char]10, [string][char]10)
+    if (`$RemoveEdgeSha256 -notmatch '^[0-9a-fA-F]{64}$') { throw 'Expected payload checksum is missing or malformed.' }
+    `$sha = [Security.Cryptography.SHA256]::Create()
+    try { `$actual = [BitConverter]::ToString(`$sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(`$source))).Replace('-', '') }
+    finally { `$sha.Dispose() }
+    if (`$actual -ne `$RemoveEdgeSha256.ToUpperInvariant()) { throw 'Downloaded script hash mismatch. Nothing was executed.' }
+
     # Running a real .ps1 lets its exit return to this -NoExit shell so the
-    # final report stays visible. The verified temporary copy is then deleted.
-    `$temporaryFile = Join-Path ([IO.Path]::GetTempPath()) ('Remove-Edge-' + [guid]::NewGuid().ToString('N') + '.ps1')
+    # final report stays visible. The verified text goes into a private
+    # directory that only this user and SYSTEM can write to, and is hashed again
+    # after being written so the file that runs is the file that was verified.
+    `$tempRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Temp'
+    if (-not (Test-Path -LiteralPath `$tempRoot -PathType Container)) { `$tempRoot = Join-Path `$env:SystemRoot 'Temp' }
+    `$tempDir = Join-Path `$tempRoot ('RemoveEdge-' + [guid]::NewGuid().ToString('N'))
+    `$temporaryFile = `$null
     try {
+        `$null = New-Item -ItemType Directory -Path `$tempDir -ErrorAction Stop
+        `$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        `$acl = New-Object Security.AccessControl.DirectorySecurity
+        `$acl.SetAccessRuleProtection(`$true, `$false)
+        foreach (`$identity in @(`$sid, [Security.Principal.SecurityIdentifier]'S-1-5-18')) {
+            `$rule = New-Object Security.AccessControl.FileSystemAccessRule(`$identity, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+            `$acl.AddAccessRule(`$rule)
+        }
+        [IO.Directory]::SetAccessControl(`$tempDir, `$acl)
+        `$temporaryFile = Join-Path `$tempDir 'Remove-Edge.ps1'
         [IO.File]::WriteAllText(`$temporaryFile, `$source, (New-Object Text.UTF8Encoding(`$true)))
+        `$written = [IO.File]::ReadAllText(`$temporaryFile).Replace([string]([char]13) + [char]10, [string][char]10)
+        `$sha2 = [Security.Cryptography.SHA256]::Create()
+        try { `$onDisk = [BitConverter]::ToString(`$sha2.ComputeHash([Text.Encoding]::UTF8.GetBytes(`$written))).Replace('-', '') }
+        finally { `$sha2.Dispose() }
+        if (`$onDisk -ne `$actual) { throw 'The written payload no longer matches the verified download.' }
         & `$temporaryFile $switches
-    } finally {
-        if (Test-Path -LiteralPath `$temporaryFile) { Remove-Item -LiteralPath `$temporaryFile -Force }
+    }
+    finally {
+        if (`$temporaryFile -and (Test-Path -LiteralPath `$temporaryFile)) { Remove-Item -LiteralPath `$temporaryFile -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath `$tempDir) { Remove-Item -LiteralPath `$tempDir -Recurse -Force -ErrorAction SilentlyContinue }
     }
 } catch {
     Write-Host (`$_.Exception.Message) -ForegroundColor Red
@@ -483,7 +824,7 @@ function Invoke-ElevationHint {
 
     if ($ScriptPath -and (Test-Path -LiteralPath $ScriptPath)) {
         Write-Info 'Run this script from an elevated PowerShell:'
-        Write-Info ('    powershell -ExecutionPolicy Bypass -File "{0}"' -f $ScriptPath)
+        Write-Info ('    powershell -NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $ScriptPath)
         Write-Info 'Or double-click Run-Elevated.cmd, which asks for elevation for you.'
     }
     elseif ($RemoveEdgeUrl) {
@@ -497,9 +838,70 @@ function Invoke-ElevationHint {
     }
 }
 
+# ------------------------------------------------------------ profile data ---
+
+function Get-EdgeProfilePath {
+    return (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Microsoft\Edge')
+}
+
+<#
+    The only directory -RemoveProfileData may ever delete: the current account's
+    Edge browser profile, derived from the registry-reported local application
+    data folder rather than from $env:LOCALAPPDATA. Traversal, a redirected
+    root, a WebView2 or shared path, or any trailing separator all fail here.
+#>
+function Test-SafeProfilePath {
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    if ($Path -match '(?i)EdgeWebView|EdgeCore|DevTools|\.\.|::$') { return $false }
+    if (-not $Path.EndsWith('\Microsoft\Edge', [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    $expected = Get-EdgeProfilePath
+    if (-not $expected) { return $false }
+    return ($Path -eq $expected)
+}
+
+function Get-DirectorySizeMb {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return 0 }
+    $sum = (Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue |
+        Measure-Object -Property Length -Sum).Sum
+    if (-not $sum) { return 0 }
+    return [math]::Round($sum / 1MB, 0)
+}
+
 # ------------------------------------------------------------------- main ---
 
-if (-not (Test-Elevated) -and -not $VerifyOnly -and -not $DryRun) {
+$ReadOnlyMode = ($VerifyOnly.IsPresent -or $DryRun.IsPresent)
+
+# A relaunched run must still be the file that was verified, before anything
+# else happens.
+try {
+    Assert-SelfIntegrity -ExpectedSha256 $ExpectedPayloadSha256
+}
+catch {
+    Write-Host ''
+    Write-Host ('Refusing to run: {0}' -f $_.Exception.Message) -ForegroundColor Red
+    exit $ExitError
+}
+
+# Environment variables decide nothing on their own, but a rewritten root is a
+# sign this process cannot be trusted with deletions, so the destructive run
+# stops here rather than relying on any later check.
+$environmentProblems = @(Get-EnvironmentProblems)
+if ($environmentProblems.Count -gt 0) {
+    Write-Step 'Warning: this process environment does not match Windows'
+    foreach ($problem in $environmentProblems) { Write-Warn $problem }
+    if ($ReadOnlyMode) {
+        Write-Info 'Read-only mode continues, but paths reported here may be unreliable.'
+    }
+    else {
+        Write-Warn 'Removal is refused because of it.'
+        Write-Info 'Open a new PowerShell window and run again; that restores the real values.'
+        exit $ExitNotElevated
+    }
+}
+
+if (-not (Test-Elevated) -and -not $ReadOnlyMode) {
     if ($NoElevate) {
         Invoke-ElevationHint
         exit $ExitNotElevated
@@ -515,8 +917,17 @@ if (-not (Test-Elevated) -and -not $VerifyOnly -and -not $DryRun) {
     Write-Host 'Administrator rights are needed - asking Windows for them now.' -ForegroundColor Yellow
     Write-Info 'Accept the "Do you want to allow this app to make changes?" prompt.'
 
+    $hostExe = Get-PowerShellHostPath
+    if (-not $hostExe) {
+        Write-Warn 'Could not locate this PowerShell installation by absolute path.'
+        Invoke-ElevationHint
+        exit $ExitNotElevated
+    }
     try {
-        Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $relaunch.Args -ErrorAction Stop
+        # The working directory is fixed to a system directory so nothing in a
+        # user-writable folder can be picked up by the elevated child.
+        Start-Process -FilePath $hostExe -Verb RunAs -ArgumentList $relaunch.Args `
+            -WorkingDirectory (Join-Path ([Environment]::GetFolderPath('Windows')) 'System32') -ErrorAction Stop
         Write-Host ''
         Write-Host 'Continuing in the new administrator window. This one can be closed.' -ForegroundColor Green
         exit $ExitRelaunched
@@ -534,12 +945,21 @@ if ($DryRun) { Write-Warn 'Dry run: nothing will be changed.' }
 
 $state = Get-EdgeState
 Show-EdgeState -State $state
+$webView2WasInstalled = $state.WebView2
 
 if ($VerifyOnly) {
     Write-Host ''
-    if ($state.AppxQueryFailed) { exit $ExitError }
+    if ($state.AppxQueryFailed) {
+        Write-Host 'Result: could not verify - the package query failed.' -ForegroundColor Yellow
+        exit $ExitError
+    }
     if (Test-EdgePresent $state) {
         Write-Host 'Result: an Edge installation or checked remnant is PRESENT.' -ForegroundColor Yellow
+        exit $ExitStillPresent
+    }
+    if (-not $state.AllUsersChecked) {
+        Write-Host 'Result: nothing found in this user''s scope. Run as administrator to' -ForegroundColor Yellow
+        Write-Host 'verify all users and provisioned packages.' -ForegroundColor Yellow
         exit $ExitStillPresent
     }
     Write-Host 'Result: no Edge installation or remnants found within the checked scope.' -ForegroundColor Green
@@ -570,7 +990,7 @@ if ($DryRun) {
     if ($install) { Write-Info ('Would run: "{0}" --uninstall --system-level --verbose-logging --force-uninstall' -f $install.Setup) }
     Write-Info 'Would remove leftover Edge files/registration if anything survives.'
     if (-not $NoReinstallBlock) { Write-Info ('Would set HKLM\SOFTWARE\Policies\Microsoft\EdgeUpdate\Install{0} = 0' -f $EdgeProductGuid) }
-    if ($RemoveProfileData) { Write-Info ('Would delete {0}' -f $state.ProfilePath) }
+    if ($RemoveProfileData) { Write-Info ('Would irreversibly delete {0}' -f (Get-EdgeProfilePath)) }
     Write-Host ''
     Write-Host 'Nothing was changed.' -ForegroundColor Green
     exit $ExitOk
@@ -589,18 +1009,23 @@ if ($state.UserEdgeExe) {
 $browsers = @(Get-InstalledBrowsers)
 if ((Test-EdgePresent $state) -and $browsers.Count -eq 0 -and -not $AllowNoOtherBrowser) {
     Write-Warn 'No supported alternative browser was detected. Install one before removing Edge.'
+    Write-Info 'Removing the only browser leaves nothing to open web pages or .htm files.'
     Write-Info 'For a portable/unrecognized browser, explicitly use -AllowNoOtherBrowser.'
     exit $ExitNotElevated
 }
 
+$restorePointCreated = $false
 if ($CreateRestorePoint) {
     Write-Step 'Creating a System Restore point'
     try {
         Checkpoint-Computer -Description 'Before removing Microsoft Edge' -RestorePointType 'MODIFY_SETTINGS' -ErrorAction Stop
+        $restorePointCreated = $true
         Write-Info 'Restore point created.'
     }
     catch {
         Write-Warn ('Could not create a restore point: {0}' -f $_.Exception.Message)
+        Write-Warn 'Removal continues because System Protection is often simply disabled.'
+        Write-Warn 'A restore point is not a backup and does not guarantee recovery.'
     }
 }
 
@@ -610,8 +1035,16 @@ foreach ($name in $ProcessNames) {
     $procs = @(Get-Process -Name $name -ErrorAction SilentlyContinue)
     if ($procs.Count -gt 0) {
         $procs | Stop-Process -Force -ErrorAction SilentlyContinue
-        Write-Info ('stopped {0} process(es): {1}' -f $procs.Count, $name)
         $stopped += $procs.Count
+        # Report what actually stopped. A browser that survived is what makes the
+        # uninstaller fail, so this must not be presented as success.
+        $remaining = @(Get-Process -Name $name -ErrorAction SilentlyContinue).Count
+        if ($remaining -eq 0) {
+            Write-Info ('stopped {0} process(es): {1}' -f $procs.Count, $name)
+        }
+        else {
+            Write-Warn ('{0} of {1} {2} process(es) are still running' -f $remaining, $procs.Count, $name)
+        }
     }
 }
 if ($stopped -eq 0) { Write-Info 'no Edge processes were running' }
@@ -619,36 +1052,50 @@ Start-Sleep -Seconds 2
 
 if ($install) {
     Write-Step "Running Microsoft's Edge uninstaller"
-    $uninstallerArgs = @('--uninstall', '--system-level', '--verbose-logging', '--force-uninstall')
-    $code = $null
-    Push-Location $install.AppDir
-    try {
-        $proc = Start-Process -FilePath $install.Setup -ArgumentList $uninstallerArgs -Wait -PassThru
-        $code = $proc.ExitCode
+    $verdict = Get-SignatureVerdict -Path $install.Setup
+    if ($verdict.Verdict -eq 'Untrusted') {
+        # The uninstaller is about to run as administrator, so an unverified
+        # binary is refused rather than executed. Direct cleanup still runs.
+        $HadOperationError = $true
+        Write-Warn ('Refusing to run the bundled uninstaller: {0}.' -f $verdict.Detail)
+        Write-Warn 'Skipping it and continuing with direct removal.'
     }
-    catch {
-        Write-Warn ('Could not start the uninstaller: {0}' -f $_.Exception.Message)
-    }
-    finally {
-        Pop-Location
-    }
-    Write-Info ('uninstaller exit code: {0}' -f $code)
-    if ($code -eq 20) {
-        # Observed on a fully successful uninstall: Edge logs "Failed to delete
-        # folder ...\Microsoft\Edge\Application" and exits 20, yet removes
-        # every binary and all of its registration. So the exit code is not a
-        # reliable success/failure signal here - the checks below are.
-        Write-Warn 'Exit code 20 can indicate incomplete cleanup; checking files and registration.'
-    }
-
-    Write-Info 'waiting for Edge to disappear...'
-    $deadline = (Get-Date).AddSeconds(120)
-    while ((Get-Date) -lt $deadline) {
-        if (-not (Test-Path -LiteralPath $install.VersionDir) -and
-            -not (Test-Path -LiteralPath (Join-Path $install.AppDir 'msedge.exe'))) {
-            break
+    else {
+        if ($verdict.Verdict -eq 'Unknown') {
+            Write-Warn ('Could not fully check the uninstaller signature ({0});' -f $verdict.Detail)
+            Write-Warn 'continuing because this machine may be offline.'
         }
-        Start-Sleep -Seconds 2
+        $uninstallerArgs = @('--uninstall', '--system-level', '--verbose-logging', '--force-uninstall')
+        $code = $null
+        Push-Location $install.AppDir
+        try {
+            $proc = Start-Process -FilePath $install.Setup -ArgumentList $uninstallerArgs -Wait -PassThru
+            $code = $proc.ExitCode
+        }
+        catch {
+            Write-Warn ('Could not start the uninstaller: {0}' -f $_.Exception.Message)
+        }
+        finally {
+            Pop-Location
+        }
+        Write-Info ('uninstaller exit code: {0}' -f $code)
+        if ($code -eq 20) {
+            # Observed on a fully successful uninstall: Edge logs "Failed to
+            # delete folder ...\Microsoft\Edge\Application" and exits 20, yet
+            # removes every binary and all of its registration. So the exit
+            # code is not a reliable signal here - the checks below are.
+            Write-Warn 'Exit code 20 can indicate incomplete cleanup; checking files and registration.'
+        }
+
+        Write-Info 'waiting for Edge to disappear...'
+        $deadline = (Get-Date).AddSeconds(120)
+        while ((Get-Date) -lt $deadline) {
+            if (-not (Test-Path -LiteralPath $install.VersionDir) -and
+                -not (Test-Path -LiteralPath (Join-Path $install.AppDir 'msedge.exe'))) {
+                break
+            }
+            Start-Sleep -Seconds 2
+        }
     }
 }
 
@@ -677,7 +1124,17 @@ if (Test-EdgePresent $state) {
     }
 
     foreach ($key in Get-EdgeRegistryPaths) {
+        if (-not (Test-EdgeRegistryPathAllowed $key)) {
+            $HadOperationError = $true
+            Write-Warn ('refused unexpected registration path {0}' -f $key)
+            continue
+        }
         if (Test-Path -LiteralPath $key) {
+            if (-not (Test-RegistryKeyNotLinked $key)) {
+                $HadOperationError = $true
+                Write-Warn ('refused linked registration path {0}' -f $key)
+                continue
+            }
             try {
                 Remove-Item -LiteralPath $key -Recurse -Force -ErrorAction Stop
                 Write-Info ('removed registration {0}' -f ($key -split '\\')[-1])
@@ -689,8 +1146,12 @@ if (Test-EdgePresent $state) {
         }
     }
 
-    $shortcutPaths = @(Get-EdgeShortcutPaths)
-    foreach ($lnk in $shortcutPaths) {
+    foreach ($lnk in Get-EdgeShortcutPaths) {
+        if (-not (Test-EdgeShortcutPathAllowed $lnk)) {
+            $HadOperationError = $true
+            Write-Warn ('refused unexpected shortcut path {0}' -f $lnk)
+            continue
+        }
         if (Test-Path -LiteralPath $lnk) {
             try {
                 Remove-Item -LiteralPath $lnk -Force -ErrorAction Stop
@@ -704,16 +1165,45 @@ if (Test-EdgePresent $state) {
     }
 
     try {
-        Get-AppxPackage -Name 'Microsoft.MicrosoftEdge.Stable' -AllUsers -ErrorAction Stop |
-            Remove-AppxPackage -AllUsers -ErrorAction Stop
-        Get-AppxProvisionedPackage -Online -ErrorAction Stop |
-            Where-Object { $_.DisplayName -eq 'Microsoft.MicrosoftEdge.Stable' } |
-            Remove-AppxProvisionedPackage -Online -ErrorAction Stop | Out-Null
-        Write-Info 'edge appx package removal attempted'
+        $packages = @(Get-AppxPackage -Name $EdgeAppxName -AllUsers -ErrorAction Stop |
+            Where-Object { Test-EdgeAppxIdentity $_ })
+        if ($packages.Count -eq 0) {
+            Write-Info 'no stable Edge appx package left to remove'
+        }
+        foreach ($package in $packages) {
+            try {
+                Remove-AppxPackage -Package $package.PackageFullName -AllUsers -ErrorAction Stop
+                Write-Info ('removed appx package {0}' -f $package.PackageFullName)
+            }
+            catch {
+                # One package failing must not hide the others.
+                $HadOperationError = $true
+                Write-Warn ('could not remove appx package {0}: {1}' -f $package.PackageFullName, $_.Exception.Message)
+            }
+        }
     }
     catch {
         $HadOperationError = $true
-        Write-Warn ('Stable Edge Appx cleanup failed: {0}' -f $_.Exception.Message)
+        Write-Warn ('Stable Edge Appx query failed: {0}' -f $_.Exception.Message)
+    }
+
+    try {
+        $provisioned = @(Get-AppxProvisionedPackage -Online -ErrorAction Stop |
+            Where-Object { $_.DisplayName -eq $EdgeAppxName })
+        foreach ($package in $provisioned) {
+            try {
+                $null = Remove-AppxProvisionedPackage -Online -PackageName $package.PackageName -ErrorAction Stop
+                Write-Info ('removed provisioned appx package {0}' -f $package.PackageName)
+            }
+            catch {
+                $HadOperationError = $true
+                Write-Warn ('could not remove provisioned appx package {0}: {1}' -f $package.PackageName, $_.Exception.Message)
+            }
+        }
+    }
+    catch {
+        $HadOperationError = $true
+        Write-Warn ('Stable Edge provisioned package query failed: {0}' -f $_.Exception.Message)
     }
 
     $state = Get-EdgeState
@@ -721,52 +1211,76 @@ if (Test-EdgePresent $state) {
 
 if (-not $NoReinstallBlock) {
     Write-Step 'Setting the Edge Update install policy'
+    $policyKey = 'HKLM:\SOFTWARE\Policies\Microsoft\EdgeUpdate'
+    $policyName = "Install$EdgeProductGuid"
     try {
-        $policyKey = 'HKLM:\SOFTWARE\Policies\Microsoft\EdgeUpdate'
         if (-not (Test-Path -LiteralPath $policyKey)) {
             $null = New-Item -Path $policyKey -Force -ErrorAction Stop
         }
-        $null = New-ItemProperty -Path $policyKey -Name "Install$EdgeProductGuid" `
+        $null = New-ItemProperty -Path $policyKey -Name $policyName `
             -Value 0 -PropertyType DWord -Force -ErrorAction Stop
-        Write-Info ('set Install{0} = 0' -f $EdgeProductGuid)
-        Write-Info 'WebView2 is not covered by this policy and keeps updating.'
+        # Read the value back: a policy that was not actually written is not a
+        # policy.
+        $written = (Get-ItemProperty -Path $policyKey -Name $policyName -ErrorAction Stop).$policyName
+        if ($written -ne 0) {
+            throw 'The policy value did not read back as 0.'
+        }
+        Write-Info ('set {0} = 0' -f $policyName)
+        Write-Info 'This names the Edge browser product only; WebView2 keeps updating.'
+        Write-Info 'It is a request to Edge Update, not a guarantee: Windows feature'
+        Write-Info 'updates and repair installs can still restore Edge.'
     }
     catch {
         $HadOperationError = $true
         Write-Warn ('could not write the reinstall policy: {0}' -f $_.Exception.Message)
     }
 }
+else {
+    Write-Step 'Skipping the Edge Update install policy'
+    Write-Info '-NoReinstallBlock was supplied; no policy value was written.'
+    Write-Info 'An existing policy, if any, was left exactly as it was.'
+}
 
+$profilePath = Get-EdgeProfilePath
 if ($RemoveProfileData) {
     Write-Step 'Removing the leftover Edge browser profile'
-    $profile = Join-Path $env:LOCALAPPDATA 'Microsoft\Edge'
-    if (Test-Path -LiteralPath $profile) {
-        $mb = [math]::Round((Get-ChildItem -LiteralPath $profile -Recurse -File -Force -ErrorAction SilentlyContinue |
-                     Measure-Object -Property Length -Sum).Sum / 1MB, 0)
+    Write-Warn 'IRREVERSIBLE: history, cookies, cache, bookmarks and locally stored'
+    Write-Warn ('passwords in {0} are permanently deleted.' -f $profilePath)
+    if (-not (Test-SafeProfilePath $profilePath)) {
+        $HadOperationError = $true
+        Write-Warn ('refused unsafe profile path {0}' -f $profilePath)
+    }
+    elseif (-not (Test-Path -LiteralPath $profilePath)) {
+        Write-Info 'no leftover profile found'
+    }
+    else {
+        $mb = Get-DirectorySizeMb $profilePath
         try {
-            $microsoft = Get-Item -LiteralPath (Split-Path -Parent $profile) -Force -ErrorAction Stop
-            if ($microsoft.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Profile parent is redirected.' }
-            Assert-NoReparsePoints $profile
-            Remove-Item -LiteralPath $profile -Recurse -Force -ErrorAction Stop
-            Write-Info ('deleted {0} (~{1} MB)' -f $profile, $mb)
+            $parent = Get-Item -LiteralPath (Split-Path -Parent $profilePath) -Force -ErrorAction Stop
+            if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Profile parent is redirected.' }
+            Assert-NoReparsePoints $profilePath
+            Remove-Item -LiteralPath $profilePath -Recurse -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $profilePath) { throw 'The profile directory still exists after deletion.' }
+            Write-Info ('deleted {0} (~{1} MB)' -f $profilePath, $mb)
         }
         catch {
             $HadOperationError = $true
-            Write-Warn ('could not fully delete {0}: {1}' -f $profile, $_.Exception.Message)
+            Write-Warn ('could not fully delete {0}: {1}' -f $profilePath, $_.Exception.Message)
         }
     }
-    else {
-        Write-Info 'no leftover profile found'
-    }
 }
-elseif (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'Microsoft\Edge')) {
-    $mb = [math]::Round((Get-ChildItem -LiteralPath (Join-Path $env:LOCALAPPDATA 'Microsoft\Edge') -Recurse -File -Force -ErrorAction SilentlyContinue |
-                 Measure-Object -Property Length -Sum).Sum / 1MB, 0)
-    Write-Info ('leftover browser profile kept (~{0} MB) - use -RemoveProfileData to delete it' -f $mb)
+elseif (Test-Path -LiteralPath $profilePath) {
+    Write-Info ('leftover browser profile kept (~{0} MB) - use -RemoveProfileData to delete it' -f (Get-DirectorySizeMb $profilePath))
 }
 
 $state = Get-EdgeState
 Show-EdgeState -State $state
+
+if ($webView2WasInstalled -and -not $state.WebView2) {
+    $HadOperationError = $true
+    Write-Warn 'WebView2 Runtime was installed before this run and is no longer detected.'
+    Write-Warn 'This tool never targets it. Repair it from an official Microsoft source.'
+}
 
 Write-Step 'Summary'
 $browsers = @(Get-InstalledBrowsers)
@@ -783,20 +1297,27 @@ if ($state.HttpProgId -eq 'MSEdgeHTM') {
     Write-Info 'otherwise links and .htm files have nothing to open them.'
 }
 
+if ($CreateRestorePoint -and -not $restorePointCreated) {
+    Write-Warn 'No restore point was created for this run.'
+}
+
 Write-Host ''
-if ($state.AppxQueryFailed -or $HadOperationError) {
-    Write-Host 'Result: one or more operations/checks failed. Review the warnings above.' -ForegroundColor Yellow
-    exit $ExitError
-}
-
-if (-not (Test-EdgePresent $state)) {
-    Write-Host 'Result: system-level Microsoft Edge and checked remnants are absent.' -ForegroundColor Green
-    Write-Info 'Windows updates may still restore Edge; shared EdgeCore/WebView2 files are kept.'
-    if (-not $state.ReinstallBlocked) {
-        Write-Info 'Note: the Edge Update install policy is not set.'
+switch (Get-RemovalOutcome -State $state -HadOperationError $HadOperationError) {
+    $ExitError {
+        Write-Host 'Result: one or more operations/checks failed. Review the warnings above.' -ForegroundColor Yellow
+        Write-Info 'Nothing here should be read as a successful removal.'
+        exit $ExitError
     }
-    exit $ExitOk
+    $ExitStillPresent {
+        Write-Host 'Result: Microsoft Edge is still present. See the messages above.' -ForegroundColor Yellow
+        exit $ExitStillPresent
+    }
+    default {
+        Write-Host 'Result: system-level Microsoft Edge and checked remnants are absent.' -ForegroundColor Green
+        Write-Info 'Windows updates may still restore Edge; shared EdgeCore/WebView2 files are kept.'
+        if (-not $state.ReinstallBlocked) {
+            Write-Info 'Note: the Edge Update install policy is not set.'
+        }
+        exit $ExitOk
+    }
 }
-
-Write-Host 'Result: Microsoft Edge is still present. See the messages above.' -ForegroundColor Yellow
-exit $ExitStillPresent
