@@ -1,0 +1,9 @@
+# Local run artifacts
+*.log
+*.tmp
+.test-fixture-*/
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini

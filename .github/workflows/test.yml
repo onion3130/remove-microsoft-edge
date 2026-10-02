@@ -1,0 +1,14 @@
+name: PowerShell checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax and non-destructive regression tests
+        shell: powershell
+        run: .\tests\Test-RemoveEdge.ps1 -SkipMachineChecks
