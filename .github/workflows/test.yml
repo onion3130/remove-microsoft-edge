@@ -8,7 +8,7 @@ jobs:
   test:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Syntax and non-destructive regression tests
         shell: powershell
         run: .\tests\Test-RemoveEdge.ps1 -SkipMachineChecks

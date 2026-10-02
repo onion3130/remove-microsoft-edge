@@ -196,3 +196,5 @@ else {
 }
 }
 Write-Host "All $script:passed assertions passed. No installation changes were made."
+# Expected child failures must not leak into CI's automatic LASTEXITCODE check.
+$global:LASTEXITCODE = 0
